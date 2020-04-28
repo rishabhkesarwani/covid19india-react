@@ -1,151 +1,218 @@
-import React, {useState, useEffect, useRef} from 'react';
+import legend from './legend';
+
+import {MAP_TYPES} from '../constants';
+import {formatNumber} from '../utils/commonfunctions';
+
 import * as d3 from 'd3';
-import {legendColor} from 'd3-svg-legend';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
+import * as Icon from 'react-feather';
 import * as topojson from 'topojson';
 
-function ChoroplethMap(props) {
-  const [rendered, setRendered] = useState(false);
-  const [states, setStates] = useState(props.states);
-  const [state, setState] = useState({});
-  const [statistic, setStatistic] = useState({});
-  const [index, setIndex] = useState(1);
+const propertyFieldMap = {
+  country: 'st_nm',
+  state: 'district',
+};
+
+function ChoroplethMap({
+  statistic,
+  mapData,
+  setHoveredRegion,
+  mapMeta,
+  changeMap,
+  selectedRegion,
+  setSelectedRegion,
+  isCountryLoaded,
+  mapOption,
+}) {
   const choroplethMap = useRef(null);
+  const choroplethLegend = useRef(null);
+  const [svgRenderCount, setSvgRenderCount] = useState(0);
 
-  useEffect(()=>{
-    if (props.states.length>1 && choroplethMap.current) {
-      mapData(choroplethMap.current);
-      setState(states[1]);
-    }
-  }, [statistic]);
+  const ready = useCallback(
+    (geoData) => {
+      d3.selectAll('svg#chart > *').remove();
 
-  useEffect(()=>{
-    if (states.length > 1) {
-      let total = 0;
-      let maxConfirmed = parseInt(states[1].confirmed);
-      let minConfirmed = parseInt(states[1].confirmed);
-      for (let i=1; i<states.length; i++) {
-        total+=parseInt(states[i].confirmed);
-        if (parseInt(states[i].confirmed) > parseInt(maxConfirmed)) maxConfirmed = parseInt(states[i].confirmed);
-        if (parseInt(states[i].confirmed) < parseInt(minConfirmed)) minConfirmed = parseInt(states[i].confirmed);
+      const propertyField = propertyFieldMap[mapMeta.mapType];
+      const svg = d3.select(choroplethMap.current);
+
+      const topology = topojson.feature(
+        geoData,
+        geoData.objects[mapMeta.graphObjectName]
+      );
+
+      const projection = d3.geoMercator();
+
+      // Set size of the map
+      let path;
+      let width;
+      let height;
+      if (!svg.attr('viewBox')) {
+        const widthStyle = parseInt(svg.style('width'));
+        if (isCountryLoaded) projection.fitWidth(widthStyle, topology);
+        else {
+          const heightStyle = parseInt(svg.style('height'));
+          projection.fitSize([widthStyle, heightStyle], topology);
+        }
+        path = d3.geoPath(projection);
+        const bBox = path.bounds(topology);
+        width = +bBox[1][0];
+        height = +bBox[1][1];
+        svg.attr('viewBox', `0 0 ${width} ${height}`);
       }
-      setStatistic({
-        total: total,
-        maxConfirmed: maxConfirmed,
-        minConfirmed: minConfirmed,
+      const bBox = svg.attr('viewBox').split(' ');
+      width = +bBox[2];
+      height = +bBox[3];
+      projection.fitSize([width, height], topology);
+      path = d3.geoPath(projection);
+
+      /* Legend */
+      const svgLegend = d3.select(choroplethLegend.current);
+      svgLegend.selectAll('*').remove();
+      const colorInterpolator = (t) => {
+        switch (mapOption) {
+          case 'confirmed':
+            return d3.interpolateReds(t * 0.85);
+          case 'active':
+            return d3.interpolateBlues(t * 0.85);
+          case 'recovered':
+            return d3.interpolateGreens(t * 0.85);
+          case 'deceased':
+            return d3.interpolateGreys(t * 0.85);
+          default:
+            return;
+        }
+      };
+      const colorScale = d3.scaleSequential(
+        [0, Math.max(1, statistic[mapOption].max)],
+        colorInterpolator
+      );
+      // Colorbar
+      const widthLegend = parseInt(svgLegend.style('width'));
+      const heightLegend = +svgLegend.attr('height');
+      svgLegend.append('g').append(() =>
+        legend({
+          color: colorScale,
+          title:
+            mapOption.charAt(0).toUpperCase() + mapOption.slice(1) + ' Cases',
+          width: widthLegend,
+          height: 0.8 * heightLegend,
+          ticks: 6,
+          tickFormat: function (d, i, n) {
+            if (!Number.isInteger(d)) return;
+            if (i === n.length - 1) return formatNumber(d) + '+';
+            return formatNumber(d);
+          },
+          marginLeft: 2,
+          marginRight: 20,
+        })
+      );
+      svgLegend.attr('viewBox', `0 0 ${widthLegend} ${heightLegend}`);
+
+      /* Draw map */
+      let onceTouchedRegion = null;
+      const g = svg.append('g').attr('class', mapMeta.graphObjectName);
+      g.append('g')
+        .attr('class', 'states')
+        .selectAll('path')
+        .data(topology.features)
+        .join('path')
+        .attr('class', `path-region ${mapOption}`)
+        .attr('fill', function (d) {
+          const region = d.properties[propertyField];
+          const n = mapData[region] ? mapData[region][mapOption] : 0;
+          const color = n === 0 ? '#ffffff' : colorScale(n);
+          return color;
+        })
+        .attr('d', path)
+        .attr('pointer-events', 'all')
+        .on('mouseenter', (d) => {
+          handleMouseEnter(d.properties[propertyField]);
+        })
+        .on('mouseleave', (d) => {
+          if (onceTouchedRegion === d) onceTouchedRegion = null;
+        })
+        .on('touchstart', (d) => {
+          if (onceTouchedRegion === d) onceTouchedRegion = null;
+          else onceTouchedRegion = d;
+        })
+        .on('click', handleClick)
+        .style('cursor', 'pointer')
+        .append('title')
+        .text(function (d) {
+          const region = d.properties[propertyField];
+          const value = mapData[region] ? mapData[region][mapOption] : 0;
+          return (
+            Number(
+              parseFloat(
+                100 * (value / (statistic[mapOption].total || 0.001))
+              ).toFixed(2)
+            ).toString() +
+            '% from ' +
+            toTitleCase(region)
+          );
+        });
+
+      g.append('path')
+        .attr('class', 'borders')
+        .attr(
+          'stroke',
+          `${
+            mapOption === 'confirmed'
+              ? '#ff073a30'
+              : mapOption === 'active'
+              ? '#007bff30'
+              : mapOption === 'recovered'
+              ? '#28a74530'
+              : mapOption === 'deceased'
+              ? '#6c757d30'
+              : ''
+          }`
+        )
+        .attr('fill', 'none')
+        .attr('stroke-width', width / 250)
+        .attr(
+          'd',
+          path(topojson.mesh(geoData, geoData.objects[mapMeta.graphObjectName]))
+        );
+
+      const handleMouseEnter = (name) => {
+        try {
+          setSelectedRegion(name);
+          setHoveredRegion(name, mapMeta);
+        } catch (err) {
+          console.log('err', err);
+        }
+      };
+
+      function handleClick(d) {
+        d3.event.stopPropagation();
+        if (onceTouchedRegion || mapMeta.mapType === MAP_TYPES.STATE) return;
+        // Disable pointer events till the new map is rendered
+        svg.attr('pointer-events', 'none');
+        g.selectAll('.path-region').attr('pointer-events', 'none');
+        // Switch map
+        changeMap(d.properties[propertyField]);
+      }
+
+      // Reset on tapping outside map
+      svg.attr('pointer-events', 'auto').on('click', () => {
+        if (mapMeta.mapType === MAP_TYPES.COUNTRY) {
+          setSelectedRegion(null);
+          setHoveredRegion('Total', mapMeta);
+        }
       });
-    }
-  }, [states.length]);
-
-  useEffect(()=>{
-    setStates(props.states);
-  }, [props.states]);
-
-  const handleMouseover = (name) => {
-    states.map((state, index) => {
-      if (state.state.toLowerCase()===name.toLowerCase()) {
-        setState(state);
-        setIndex(index);
-      }
-    });
-  };
-
-  const mapData = (selector) => {
-    const svg = d3.select(selector);
-    const width = +svg.attr('width');
-    const height = +svg.attr('height');
-
-    const unemployment = d3.map();
-
-    const projection = d3.geoMercator()
-        .center([78.9, 19])
-        .scale(1000)
-        .translate([width/2, height/2]);
-
-    const path = d3.geoPath(projection);
-
-    // Colorbar
-    const maxInterpolation = 0.8;
-
-    function label({i, genLength, generatedLabels, labelDelimiter}) {
-      if (i === genLength - 1) {
-        const n = Math.floor(generatedLabels[i]);
-        return `${n}+`;
-      } else {
-        const n1 = Math.floor(generatedLabels[i]);
-        const n2 = Math.floor(generatedLabels[i+1]);
-        return `${n1} - ${n2}`;
-      }
-    }
-
-    const color = d3.scaleSequential(d3.interpolateReds)
-        .domain([0, statistic.maxConfirmed / maxInterpolation]);
-
-    svg.append('g')
-        .attr('class', 'legendLinear')
-        .attr('transform', 'translate(1, 375)');
-
-    const numCells = 6;
-    const delta = Math.floor(statistic.maxConfirmed / (numCells - 1));
-    const cells = Array.from(Array(numCells).keys()).map((i) => i * delta);
-
-    const legendLinear = legendColor()
-        .shapeWidth(50)
-        .cells(cells)
-        .titleWidth(3)
-        .labels(label)
-        .title('Confirmed Cases')
-        .orient('vertical')
-        .scale(color);
-
-    svg.select('.legendLinear')
-        .call(legendLinear);
-
-
-    const promises = [
-      d3.json('/india.json'),
-    ];
-
-    Promise.all(promises).then(ready);
-
-    function ready([india]) {
-      states.map((state, index) => {
-        unemployment.set(state.state.toLowerCase(), state.confirmed);
-      });
-
-      svg.append('g')
-          .attr('class', 'states')
-          .selectAll('path')
-          .data(topojson.feature(india, india.objects.india).features)
-          .enter().append('path')
-          .attr('fill', function(d) {
-            const n = unemployment.get(d.properties.ST_NM.toLowerCase());
-            return d3.interpolateReds(d.confirmed = (n>0)*0.05 + n/statistic.maxConfirmed*maxInterpolation);
-          })
-          .attr('d', path)
-          .attr('pointer-events', 'all')
-          .on('mouseenter', (d) => {
-            handleMouseover(d.properties.ST_NM);
-            const target = d3.event.target;
-            d3.select(target.parentNode.appendChild(target)).attr('stroke', '#ff073a').attr('stroke-width', 2);
-          })
-          .on('mouseleave', (d) => {
-            const n = unemployment.get(d.properties.ST_NM.toLowerCase());
-            const target = d3.event.target;
-            d3.select(target).attr('fill', d3.interpolateReds(d.confirmed = (n>0)*0.05 + n/statistic.maxConfirmed*maxInterpolation)).attr('stroke', 'None');
-          })
-          .style('cursor', 'pointer')
-          .append('title')
-          .text(function(d) {
-            return parseFloat(100*(unemployment.get(d.properties.ST_NM.toLowerCase())/statistic.total)).toFixed(2) + '% from ' + toTitleCase(d.properties.ST_NM);
-          });
-
-      svg.append('path')
-          .attr('stroke', '#ff073a20')
-          .attr('fill', 'none')
-          .attr('stroke-width', 2)
-          .attr('d', path(topojson.mesh(india, india.objects.india)));
-    };
-  };
+    },
+    [
+      mapMeta,
+      statistic,
+      mapOption,
+      isCountryLoaded,
+      mapData,
+      setSelectedRegion,
+      setHoveredRegion,
+      changeMap,
+    ]
+  );
 
   const toTitleCase = (str) => {
     str = str.toLowerCase().split(' ');
@@ -155,53 +222,75 @@ function ChoroplethMap(props) {
     return str.join(' ');
   };
 
+  useEffect(() => {
+    (async () => {
+      const data = await d3.json(mapMeta.geoDataFile);
+      if (statistic && choroplethMap.current) {
+        ready(data);
+        setSvgRenderCount((prevCount) => prevCount + 1);
+      }
+    })();
+  }, [mapMeta.geoDataFile, statistic, ready]);
+
+  useEffect(() => {
+    const highlightRegionInMap = (name) => {
+      const paths = d3.selectAll('.path-region');
+      paths.classed('map-hover', (d, i, nodes) => {
+        const propertyField =
+          'district' in d.properties
+            ? propertyFieldMap['state']
+            : propertyFieldMap['country'];
+        if (name === d.properties[propertyField]) {
+          nodes[i].parentNode.appendChild(nodes[i]);
+          return true;
+        }
+        return false;
+      });
+    };
+    highlightRegionInMap(selectedRegion);
+  }, [svgRenderCount, selectedRegion]);
+
   return (
-    <div className="ChoroplethMap fadeInUp" style={{animationDelay: '1.2s'}}>
-      <h1 className="header">Statistics by State</h1>
-      <h6 className="header">{window.innerWidth <=769 ? 'Tap' : 'Hover'} over a state for more details</h6>
-      <div className="svg-parent">
-        <svg id="chart" width="650" height={window.innerWidth <= 479 ? 650: 750} viewBox={`0 0 650 ${window.innerWidth <= 479 ? 650: 750}`} preserveAspectRatio="xMidYMid meet" ref={choroplethMap}></svg>
+    <div>
+      <div className="svg-parent fadeInUp" style={{animationDelay: '2.5s'}}>
+        <svg
+          id="chart"
+          preserveAspectRatio="xMidYMid meet"
+          ref={choroplethMap}
+        ></svg>
+        {(mapOption === 'recovered' && mapData?.Unknown?.recovered) ||
+        (mapOption === 'deceased' && mapData?.Unknown?.deceased) ? (
+          <div className="disclaimer">
+            <Icon.AlertCircle />
+            {`District-wise ${mapOption} numbers are under reconciliation`}
+          </div>
+        ) : (
+          ''
+        )}
       </div>
-
-      <div className="map-stats">
-        <h4>{state.state}</h4>
-
-        <div className="stats">
-          <h5>Confirmed</h5>
-          <div className="stats-bottom">
-            <h1>{state.confirmed}</h1>
-            <h6>{}</h6>
-          </div>
-        </div>
-
-        <div className="stats is-blue">
-          <h5>Active</h5>
-          <div className="stats-bottom">
-            <h1>{state.active}</h1>
-            <h6>{}</h6>
-          </div>
-        </div>
-
-        <div className="stats is-green">
-          <h5>Recovered</h5>
-          <div className="stats-bottom">
-            <h1>{state.recovered}</h1>
-            <h6>{}</h6>
-          </div>
-        </div>
-
-        <div className="stats is-gray">
-          <h5>Deceased</h5>
-          <div className="stats-bottom">
-            <h1>{state.deaths}</h1>
-            <h6>{}</h6>
-          </div>
-        </div>
-
+      <div
+        className="svg-parent legend fadeInUp"
+        style={{animationDelay: '2.5s'}}
+      >
+        <svg
+          id="legend"
+          height="65"
+          preserveAspectRatio="xMidYMid meet"
+          ref={choroplethLegend}
+        ></svg>
       </div>
-
+      <svg style={{position: 'absolute', height: 0}}>
+        <defs>
+          <filter id="balance-color" colorInterpolationFilters="sRGB">
+            <feColorMatrix
+              type="matrix"
+              values="0.91372549 0 0 0 0.08627451 0 0.91372549 0 0 0.08627451 0 0 0.854901961 0 0.145098039 0 0 0 1 0"
+            />
+          </filter>
+        </defs>
+      </svg>
     </div>
   );
 }
 
-export default ChoroplethMap;
+export default React.memo(ChoroplethMap);
